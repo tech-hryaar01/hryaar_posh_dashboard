@@ -54,7 +54,7 @@ class ProductionEnterpriseMiddleware(BaseHTTPMiddleware):
 
         # 1. Rate Limiting for Auth & Billing checkout endpoints (skip synthetic FastAPI TestClient IP)
         if client_ip != "testclient":
-            if path.endswith("/auth/login") and request.method == "POST":
+            if (path.endswith("/auth/login") or path.endswith("/auth/google")) and request.method == "POST":
                 if not auth_rate_limiter.is_allowed(client_ip):
                     return JSONResponse(
                         status_code=429,

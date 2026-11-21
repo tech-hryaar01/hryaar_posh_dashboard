@@ -109,10 +109,134 @@ export default function Home() {
   }, [selectedCompanyId, user?.company_id, subscribeToEvent]);
 
   const [mounted, setMounted] = useState(false);
+  const [googleReady, setGoogleReady] = useState(false);
 
   useEffect(() => {
     setMounted(true);
   }, []);
+
+  const handleGoogleSuccess = async (credential: string) => {
+    setLoginLoading(true);
+    setLoginError(null);
+
+    try {
+      const res = await apiClient.post('/auth/google', {
+        id_token: credential,
+      });
+
+      const data = res.data;
+      const access_token = data.access_token;
+      const baseUser = data.user || data;
+      const loggedUser = {
+        ...baseUser,
+        id: baseUser.id || baseUser.user_id || 'usr-active',
+      };
+      try {
+        localStorage.setItem('posh_token', access_token);
+      } catch {}
+      setToken(access_token);
+      setUser(loggedUser);
+      setInspectedCompanyId(null);
+
+      if (loggedUser?.workspace === 'IC_WORKSPACE' || loggedUser?.role === 'IC_MEMBER') {
+        setCurrentTab('complaints');
+      } else {
+        setCurrentTab('dashboard');
+      }
+
+      if (
+        loggedUser?.company_id &&
+        loggedUser?.workspace !== 'INTERNAL_PLATFORM' &&
+        loggedUser?.workspace !== 'PARTNER_WORKSPACE' &&
+        loggedUser?.workspace !== 'LEARNER_WORKSPACE' &&
+        loggedUser?.company_type !== 'PARTNER' &&
+        loggedUser?.role !== 'SUPER_ADMIN' &&
+        loggedUser?.role !== 'PARTNER_ADMIN' &&
+        loggedUser?.role !== 'EMPLOYEE'
+      ) {
+        setSelectedCompanyId(loggedUser.company_id);
+        loadDashboardData(loggedUser.company_id);
+      }
+    } catch (err: any) {
+      const isTimeout = err?.code === 'ECONNABORTED' || (err?.message && err.message.toLowerCase().includes('timeout'));
+      if (isTimeout) {
+        setLoginError('Server cold-start in progress. Waking up live cloud container... Please try Google Sign-In again.');
+      } else {
+        setLoginError(err.response?.data?.detail || err.message || 'Google authentication failed');
+      }
+    } finally {
+      setLoginLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    const clientId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID || '';
+    if (!clientId) {
+      return;
+    }
+
+    let isMounted = true;
+
+    const setupGoogleGsi = () => {
+      if (typeof window === 'undefined' || !(window as any).google?.accounts?.id) return;
+      try {
+        (window as any).google.accounts.id.initialize({
+          client_id: clientId,
+          callback: (response: any) => {
+            if (response?.credential) {
+              handleGoogleSuccess(response.credential);
+            }
+          },
+          auto_select: false,
+          cancel_on_tap_outside: true,
+        });
+
+        const targetDiv = document.getElementById('googleSignInBtnDiv');
+        if (targetDiv) {
+          targetDiv.innerHTML = '';
+          (window as any).google.accounts.id.renderButton(targetDiv, {
+            type: 'standard',
+            theme: 'filled_black',
+            size: 'large',
+            text: 'continue_with',
+            shape: 'rectangular',
+            logo_alignment: 'left',
+            width: targetDiv.clientWidth || 360,
+          });
+        }
+        if (isMounted) setGoogleReady(true);
+      } catch (e) {
+        console.warn('Google GSI initialization notice:', e);
+      }
+    };
+
+    if ((window as any).google?.accounts?.id) {
+      setupGoogleGsi();
+    } else {
+      const timer = setInterval(() => {
+        if ((window as any).google?.accounts?.id) {
+          clearInterval(timer);
+          setupGoogleGsi();
+        }
+      }, 250);
+      return () => {
+        isMounted = false;
+        clearInterval(timer);
+      };
+    }
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  const triggerGooglePrompt = () => {
+    if (typeof window !== 'undefined' && (window as any).google?.accounts?.id) {
+      (window as any).google.accounts.id.prompt();
+    } else {
+      setLoginError('Google SSO is connecting. Please click again in a moment.');
+    }
+  };
 
   const instantEnterWorkspace = (role: 'SUPER_ADMIN' | 'COMPANY_ADMIN' | 'PARTNER_ADMIN') => {
     const creds =
@@ -403,7 +527,31 @@ export default function Home() {
             </div>
           </div>
 
-          <div className="relative flex items-center justify-center my-5">
+          {/* Google OAuth 2.0 Corporate SSO */}
+          <div className="space-y-2 mt-4">
+            <div
+              id="googleSignInBtnDiv"
+              className="w-full flex items-center justify-center min-h-[44px] overflow-hidden rounded-xl border border-slate-700/60 bg-[#061122] hover:border-slate-500 transition-all [&>div]:!w-full [&>div]:!flex [&>div]:!justify-center"
+            />
+            {!googleReady && (
+              <button
+                type="button"
+                disabled={loginLoading}
+                onClick={triggerGooglePrompt}
+                className="w-full py-2.5 px-4 bg-slate-900 hover:bg-slate-800 border border-slate-700 hover:border-blue-500/50 text-white font-medium text-xs rounded-xl transition-all flex items-center justify-center gap-3 cursor-pointer shadow-sm active:scale-95 disabled:opacity-50"
+              >
+                <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24">
+                  <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
+                  <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
+                  <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z" />
+                  <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z" />
+                </svg>
+                <span>Continue with Google</span>
+              </button>
+            )}
+          </div>
+
+          <div className="relative flex items-center justify-center my-4">
             <div className="border-t border-slate-800 w-full" />
             <span className="bg-[#0A192F] px-2.5 text-[10px] font-bold uppercase tracking-wider text-slate-500 shrink-0">
               Or Manual Corporate Sign-In

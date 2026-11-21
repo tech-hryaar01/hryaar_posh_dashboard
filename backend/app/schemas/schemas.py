@@ -36,6 +36,9 @@ class UserLogin(BaseModel):
     email: str
     password: str
 
+class GoogleLoginRequest(BaseModel):
+    id_token: str
+
 class UserCreate(BaseModel):
     email: str
     full_name: str

@@ -68,8 +68,16 @@ class Settings(BaseSettings):
         "http://127.0.0.1:3000",
         "http://localhost:3001",
         "http://127.0.0.1:3001",
+        "http://localhost:3005",
+        "http://127.0.0.1:3005",
         "https://app.hryaar.com",
+        "https://hryaar-posh-dashboard-nu.vercel.app",
     ]
+
+    # Google OAuth 2.0 Credentials (loaded securely via environment variables)
+    GOOGLE_CLIENT_ID: Optional[str] = os.getenv("GOOGLE_CLIENT_ID")
+    GOOGLE_CLIENT_SECRET: Optional[str] = os.getenv("GOOGLE_CLIENT_SECRET")
+    AUTO_PROVISION_GOOGLE_USERS: bool = True
 
     model_config = ConfigDict(
         env_file=".env",

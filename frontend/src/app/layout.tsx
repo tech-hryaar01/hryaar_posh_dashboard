@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import Script from "next/script";
 import "./globals.css";
 import { RealtimeProvider } from "@/lib/realtime";
 
@@ -18,6 +19,10 @@ export default function RootLayout({
         <RealtimeProvider>
           {children}
         </RealtimeProvider>
+        <Script
+          src="https://accounts.google.com/gsi/client"
+          strategy="afterInteractive"
+        />
       </body>
     </html>
   );

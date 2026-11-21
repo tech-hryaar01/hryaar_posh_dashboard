@@ -1,6 +1,7 @@
 import uuid
+import httpx
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from jose import JWTError, jwt
 from sqlalchemy import func
@@ -8,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.db.session import get_db
 from app.models.models import User, Company, AuditLog, Employee, UserSession
 from app.schemas.schemas import (
-    Token, UserLogin, UserCreate, UserOut, PasswordChangeRequest, UserSessionOut
+    Token, UserLogin, GoogleLoginRequest, UserCreate, UserOut, PasswordChangeRequest, UserSessionOut
 )
 from app.core.security import (
     verify_password, get_password_hash, create_access_token, needs_password_rehash, validate_password_strength
@@ -136,6 +137,177 @@ def login(login_data: UserLogin, request: Request, db: Session = Depends(get_db)
     ))
     db.commit()
 
+    return _generate_auth_token_response(user, company, emp, jti, db)
+
+
+@router.post("/google", response_model=Token)
+async def login_google(
+    login_data: GoogleLoginRequest,
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """
+    Cryptographically verifies Google OAuth 2.0 ID Token, matches user/tenant, and issues a cluster JWT.
+    Supports auto-provisioning for corporate domain evaluation.
+    """
+    id_token = login_data.id_token.strip()
+    if not id_token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing Google identity credential token."
+        )
+
+    # 1. Verify token with Google's public tokeninfo service
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                "https://oauth2.googleapis.com/tokeninfo",
+                params={"id_token": id_token}
+            )
+            if resp.status_code != 200:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Google verification failed: Invalid, expired, or revoked credential."
+                )
+            google_data = resp.json()
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Unable to contact Google OAuth verification authority: {str(exc)}"
+        )
+
+    # 2. Audience verification
+    token_aud = google_data.get("aud")
+    if settings.GOOGLE_CLIENT_ID and token_aud != settings.GOOGLE_CLIENT_ID:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Google token audience does not match configured application Client ID."
+        )
+
+    # 3. Extract and sanitize email and identity profile
+    email = google_data.get("email")
+    if not email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Google profile does not contain a valid email address."
+        )
+
+    normalized_email = email.strip().lower()
+    full_name = google_data.get("name") or normalized_email.split("@")[0].title()
+
+    lock_key = f"auth_lock:{normalized_email}"
+    if distributed_cache.get(lock_key) is True:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Account temporarily locked due to repeated authentication attempts. Retry in 15 minutes.",
+            headers={"Retry-After": str(AUTH_LOCKOUT_WINDOW_SECONDS)},
+        )
+
+    # 4. Lookup user by email in database
+    user = db.query(User).filter(func.lower(User.email) == normalized_email).first()
+    emp = None
+
+    if not user:
+        # Check employee roster
+        emp = db.query(Employee).filter(func.lower(Employee.email) == normalized_email).first()
+        if emp:
+            user = User(
+                email=emp.email.lower(),
+                full_name=full_name or f"{emp.first_name} {emp.last_name}",
+                hashed_password=get_password_hash(str(uuid.uuid4())),
+                role="EMPLOYEE",
+                company_id=emp.company_id,
+                designation=emp.designation or "Employee / Learner",
+                is_active=True,
+                status="ACTIVE"
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+        elif settings.AUTO_PROVISION_GOOGLE_USERS:
+            # Platform administration domain check
+            if normalized_email.endswith("@hryaar.com"):
+                user = User(
+                    email=normalized_email,
+                    full_name=full_name,
+                    hashed_password=get_password_hash(str(uuid.uuid4())),
+                    role="SUPER_ADMIN",
+                    company_id=None,
+                    designation="HRYAAR Executive",
+                    is_active=True,
+                    status="ACTIVE"
+                )
+            else:
+                # Find default corporate client showcase tenant
+                showcase_company = db.query(Company).filter(Company.company_type == "CLIENT").first()
+                target_company_id = showcase_company.id if showcase_company else None
+                user = User(
+                    email=normalized_email,
+                    full_name=full_name,
+                    hashed_password=get_password_hash(str(uuid.uuid4())),
+                    role="COMPANY_ADMIN",
+                    company_id=target_company_id,
+                    designation="Corporate Administrator",
+                    is_active=True,
+                    status="ACTIVE"
+                )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Google account '{normalized_email}' is not authorized. Please ask your administrator to register your corporate email."
+            )
+
+    if not user.is_active or user.status == "SUSPENDED":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is deactivated or suspended")
+
+    company = None
+    if user.company_id:
+        company = db.query(Company).filter(Company.id == user.company_id).first()
+        if not company or not company.is_active or company.status == "SUSPENDED":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Organization subscription or access has been suspended"
+            )
+
+    user.last_login_at = datetime.utcnow()
+    client_ip = _resolve_client_ip(request)
+    user_agent = (request.headers.get("User-Agent") or "Google OAuth Client")[:250]
+
+    jti = str(uuid.uuid4())
+    session_expires = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    db.add(UserSession(
+        user_id=user.id,
+        jti=jti,
+        ip_address=client_ip,
+        user_agent=user_agent,
+        is_revoked=False,
+        expires_at=session_expires
+    ))
+
+    db.add(AuditLog(
+        company_id=user.company_id,
+        actor_user_id=user.id,
+        user_email=user.email,
+        ip_address=client_ip,
+        action="AUTH_GOOGLE_SUCCESS",
+        details=f"Authenticated via Google OAuth 2.0 SSO for role {user.role} (Google Sub: {google_data.get('sub')})"
+    ))
+    db.commit()
+
+    # Reuse standard token assembly
+    return _generate_auth_token_response(user, company, emp, jti, db)
+
+
+def _generate_auth_token_response(
+    user: User,
+    company: Optional[Company],
+    emp: Optional[Employee],
+    jti: str,
+    db: Session
+) -> Token:
     company_name = company.name if company else "HRYAAR Platform"
     logo_url = company.logo_url if company else None
     primary_color = company.primary_color if company else "#2A62FF"
