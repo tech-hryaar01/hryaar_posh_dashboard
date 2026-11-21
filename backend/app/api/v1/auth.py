@@ -147,23 +147,30 @@ async def login_google(
     db: Session = Depends(get_db)
 ):
     """
-    Cryptographically verifies Google OAuth 2.0 ID Token, matches user/tenant, and issues a cluster JWT.
+    Cryptographically verifies Google OAuth 2.0 ID Token or Access Token, matches user/tenant, and issues a cluster JWT.
     Supports auto-provisioning for corporate domain evaluation.
     """
-    id_token = login_data.id_token.strip()
-    if not id_token:
+    id_token = (login_data.id_token or "").strip()
+    access_token = (login_data.access_token or "").strip()
+    if not id_token and not access_token:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Missing Google identity credential token."
         )
 
-    # 1. Verify token with Google's public tokeninfo service
+    # 1. Verify token with Google's public tokeninfo or userinfo service
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                "https://oauth2.googleapis.com/tokeninfo",
-                params={"id_token": id_token}
-            )
+            if id_token:
+                resp = await client.get(
+                    "https://oauth2.googleapis.com/tokeninfo",
+                    params={"id_token": id_token}
+                )
+            else:
+                resp = await client.get(
+                    "https://www.googleapis.com/oauth2/v3/userinfo",
+                    headers={"Authorization": f"Bearer {access_token}"}
+                )
             if resp.status_code != 200:
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
@@ -176,9 +183,9 @@ async def login_google(
             detail=f"Unable to contact Google OAuth verification authority: {str(exc)}"
         )
 
-    # 2. Audience verification
+    # 2. Audience verification (for ID tokens)
     token_aud = google_data.get("aud")
-    if settings.GOOGLE_CLIENT_ID and token_aud != settings.GOOGLE_CLIENT_ID:
+    if id_token and settings.GOOGLE_CLIENT_ID and token_aud and token_aud != settings.GOOGLE_CLIENT_ID:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Google token audience does not match configured application Client ID."

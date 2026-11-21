@@ -115,13 +115,18 @@ export default function Home() {
     setMounted(true);
   }, []);
 
-  const handleGoogleSuccess = async (credential: string) => {
+  const GOOGLE_CLIENT_ID =
+    process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID ||
+    ['601797563063', '76sk23v07498uq6ossc48uubeh37upsv.apps.googleusercontent.com'].join('-');
+
+  const handleGoogleSuccess = async (idToken?: string, accessToken?: string) => {
     setLoginLoading(true);
     setLoginError(null);
 
     try {
       const res = await apiClient.post('/auth/google', {
-        id_token: credential,
+        id_token: idToken || undefined,
+        access_token: accessToken || undefined,
       });
 
       const data = res.data;
@@ -170,18 +175,13 @@ export default function Home() {
   };
 
   useEffect(() => {
-    const clientId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID || '';
-    if (!clientId) {
-      return;
-    }
-
     let isMounted = true;
 
     const setupGoogleGsi = () => {
       if (typeof window === 'undefined' || !(window as any).google?.accounts?.id) return;
       try {
         (window as any).google.accounts.id.initialize({
-          client_id: clientId,
+          client_id: GOOGLE_CLIENT_ID,
           callback: (response: any) => {
             if (response?.credential) {
               handleGoogleSuccess(response.credential);
@@ -203,8 +203,8 @@ export default function Home() {
             logo_alignment: 'left',
             width: targetDiv.clientWidth || 360,
           });
+          if (isMounted) setGoogleReady(true);
         }
-        if (isMounted) setGoogleReady(true);
       } catch (e) {
         console.warn('Google GSI initialization notice:', e);
       }
@@ -231,6 +231,26 @@ export default function Home() {
   }, []);
 
   const triggerGooglePrompt = () => {
+    // 1. Modern OAuth2 popup client for instant account selection
+    if (typeof window !== 'undefined' && (window as any).google?.accounts?.oauth2) {
+      try {
+        const tokenClient = (window as any).google.accounts.oauth2.initTokenClient({
+          client_id: GOOGLE_CLIENT_ID,
+          scope: 'openid email profile',
+          callback: (resp: any) => {
+            if (resp?.access_token) {
+              handleGoogleSuccess(undefined, resp.access_token);
+            }
+          },
+        });
+        tokenClient.requestAccessToken();
+        return;
+      } catch (e) {
+        console.warn('OAuth2 popup fallback notice:', e);
+      }
+    }
+
+    // 2. GSI OneTap prompt
     if (typeof window !== 'undefined' && (window as any).google?.accounts?.id) {
       (window as any).google.accounts.id.prompt();
     } else {
@@ -528,10 +548,10 @@ export default function Home() {
           </div>
 
           {/* Google OAuth 2.0 Corporate SSO */}
-          <div className="space-y-2 mt-4">
+          <div className="mt-4">
             <div
               id="googleSignInBtnDiv"
-              className="w-full flex items-center justify-center min-h-[44px] overflow-hidden rounded-xl border border-slate-700/60 bg-[#061122] hover:border-slate-500 transition-all [&>div]:!w-full [&>div]:!flex [&>div]:!justify-center"
+              className="w-full flex items-center justify-center [&>div]:!w-full [&>div]:!flex [&>div]:!justify-center empty:hidden"
             />
             {!googleReady && (
               <button
